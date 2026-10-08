@@ -46,8 +46,9 @@ def _validar_request(data: dict) -> list[str]:
         errores.append("parametros.nivelesConfianza no puede estar vacío.")
 
     activos = data["activos"]
-    if not activos:
-        errores.append("La lista 'activos' está vacía.")
+    bonos = (data.get("rentaFija") or {}).get("instrumentos") or []
+    if not activos and not bonos:
+        errores.append("La lista 'activos' está vacía (y no hay instrumentos de renta fija).")
     for i, activo in enumerate(activos):
         for campo in ("nombre", "numAcciones", "precioActual", "monedaActivo"):
             if campo not in activo:
@@ -84,6 +85,7 @@ def calcular():
             parametros=data["parametros"],
             activos=data["activos"],
             escenarios=data["escenarios"],
+            renta_fija=data.get("rentaFija"),
         )
         resultado = motor.calcular(
             metodologias=data["parametros"]["metodologias"],

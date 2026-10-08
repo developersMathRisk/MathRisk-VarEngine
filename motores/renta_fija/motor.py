@@ -192,6 +192,67 @@ def _tir(flujos_monto: np.ndarray, t_anios: np.ndarray, precio: float) -> Option
     return 0.5 * (lo + hi)
 
 
+def riesgo_instrumento(flujos: pd.DataFrame, curva: EscenariosCurva, nominal: float, mtm_origen: float) -> dict:
+    """Duración, convexidad, TIR e interés corrido en moneda de origen, con la curva base (fila idx_base)."""
+    vivos = flujos[flujos["dias"] > 0]
+    t = vivos["dias"].to_numpy() / BASE_DIAS
+    cf = nominal * vivos["montoPct"].to_numpy() / 100.0
+    f_base = curva.factor_en(vivos["dias"].to_numpy())[curva.idx_base]
+    pv = cf * f_base
+    total = pv.sum()
+    macaulay = float((pv * t).sum() / total) if total else 0.0
+    tir = _tir(cf, t, mtm_origen)
+    if tir is not None:
+        modificada = macaulay / (1.0 + tir)
+        convexidad = float((pv * t * (t + 1.0)).sum() / total / (1.0 + tir) ** 2) if total else 0.0
+    else:
+        modificada, convexidad = None, None
+    corrido = float(np.sum(
+        np.where(flujos["diasPlazo"] > 0, flujos["diasCorrido"] / flujos["diasPlazo"].replace(0, np.nan), 0.0)
+        * flujos["montoPct"] / 100.0 * nominal))
+    return {"duracionMacaulay": macaulay, "duracionModificada": modificada, "convexidad": convexidad,
+            "tir": tir, "interesCorrido": corrido, "precioLimpio": (mtm_origen - corrido) / nominal}
+
+
+def curva_en_fechas(puntos: List[dict], fecha_base: pd.Timestamp, fechas: List[pd.Timestamp], nombre: str) -> EscenariosCurva:
+    """
+    Escenarios de curva alineados a una lista de fechas externa (las del motor de VaR unificado).
+    Fila 0 = curva base (fecha de valoración, sin perturbar). Fila k (k >= 1) = base + cambio absoluto
+    de cada plazo entre fechas[k-1] y fechas[k], con piso 0: el mismo intervalo que usa la variación de
+    precio de las acciones en ese escenario, para que ambos riesgos se junten en el mismo día.
+    """
+    if not puntos:
+        raise ErrorDatosRentaFija(f"La curva '{nombre}' no trae puntos.")
+    df = pd.DataFrame(puntos)
+    faltan = {"fecha", "plazoDias", "tasa"} - set(df.columns)
+    if faltan:
+        raise ErrorDatosRentaFija(f"Curva '{nombre}': faltan campos {sorted(faltan)}.")
+    df["fecha"] = pd.to_datetime(df["fecha"]).dt.normalize()
+    df["tasa"] = pd.to_numeric(df["tasa"], errors="coerce")
+    df["plazoDias"] = pd.to_numeric(df["plazoDias"], errors="coerce")
+    df = df.dropna(subset=["tasa", "plazoDias"])
+
+    m = df.pivot_table(index="fecha", columns="plazoDias", values="tasa", aggfunc="last").sort_index().ffill()
+    if fecha_base not in m.index:
+        raise ErrorDatosRentaFija(f"La curva '{nombre}' no tiene datos en la fecha de valoración ({fecha_base.date()}).")
+    base = m.loc[fecha_base]
+    m = m.loc[:, base.notna()]
+    base = base[base.notna()]
+    if m.shape[1] == 0:
+        raise ErrorDatosRentaFija(f"La curva '{nombre}' no tiene plazos en la fecha de valoración.")
+
+    idx = pd.DatetimeIndex(fechas)
+    alineada = m.reindex(m.index.union(idx)).ffill().loc[idx]
+    if alineada.isna().any().any():
+        primera = alineada.index[alineada.isna().any(axis=1)][0]
+        raise ErrorDatosRentaFija(f"La curva '{nombre}' no cubre el escenario del {primera.date()}.")
+    cambios = alineada.diff().iloc[1:]                                   # (S-1, P)
+    tasas = np.vstack([base.to_numpy(), (cambios + base).clip(lower=0.0).to_numpy()])
+    plazos = m.columns.to_numpy(dtype=float)
+    factores = 1.0 / (1.0 + tasas / 100.0) ** (plazos[None, :] / BASE_DIAS)
+    return EscenariosCurva(plazos, pd.DatetimeIndex([fecha_base]).append(idx[1:]), tasas, factores, 0)
+
+
 class MotorRentaFija:
     def __init__(self, parametros: dict, instrumentos: List[dict], curvas: Dict[str, List[dict]],
                  tipos_cambio: Optional[Dict[str, List[dict]]] = None):
@@ -269,25 +330,7 @@ class MotorRentaFija:
                 "mtm": base, "mtmOrigen": float(serie.loc[self.fecha_portafolio]), "pnl": pnl, **riesgo}
 
     def _riesgo(self, instr, flujos, curva: EscenariosCurva, nominal: float, mtm_origen: float) -> dict:
-        """Duración, convexidad, TIR e interés corrido en moneda de origen, con la curva base."""
-        vivos = flujos[flujos["dias"] > 0]
-        t = vivos["dias"].to_numpy() / BASE_DIAS
-        cf = nominal * vivos["montoPct"].to_numpy() / 100.0
-        f_base = curva.factor_en(vivos["dias"].to_numpy())[curva.idx_base]
-        pv = cf * f_base
-        total = pv.sum()
-        macaulay = float((pv * t).sum() / total) if total else 0.0
-        tir = _tir(cf, t, mtm_origen)
-        if tir is not None:
-            modificada = macaulay / (1.0 + tir)
-            convexidad = float((pv * t * (t + 1.0)).sum() / total / (1.0 + tir) ** 2) if total else 0.0
-        else:
-            modificada, convexidad = None, None
-        corrido = float(np.sum(
-            np.where(flujos["diasPlazo"] > 0, flujos["diasCorrido"] / flujos["diasPlazo"].replace(0, np.nan), 0.0)
-            * flujos["montoPct"] / 100.0 * nominal))
-        return {"duracionMacaulay": macaulay, "duracionModificada": modificada, "convexidad": convexidad,
-                "tir": tir, "interesCorrido": corrido, "precioLimpio": (mtm_origen - corrido) / nominal}
+        return riesgo_instrumento(flujos, curva, nominal, mtm_origen)
 
     # --- cálculo total ---
     def calcular(self) -> dict:

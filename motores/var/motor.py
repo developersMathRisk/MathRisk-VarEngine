@@ -1,8 +1,8 @@
 """
 motores/var/motor.py
 =====================
-Motor de cálculo de Value at Risk (VaR) para un portafolio de acciones y/o
-fondos mutuos, con tres metodologías sobre la MISMA ventana de escenarios
+Motor de cálculo de Value at Risk (VaR) para un portafolio de acciones, fondos
+mutuos y renta fija (bonos y CD), con tres metodologías sobre la MISMA ventana de escenarios
 históricos, para que los resultados sean comparables entre sí:
 
   1. Histórico    — percentil empírico de la distribución real de P&L.
@@ -16,6 +16,12 @@ Quien construye ese JSON con datos reales es el backend Java (Spring), que
 ya tiene acceso a los precios y tipos de cambio en PostgreSQL. Así el motor
 queda desacoplado y se puede probar con cualquier fuente de datos.
 
+Renta fija (bloque opcional `rentaFija`): cada bono se revalúa en la fecha de valoración con la curva
+base más el cambio absoluto de cada plazo entre las MISMAS fechas consecutivas que usan los escenarios de
+precio (ver renta_fija.motor.curva_en_fechas). Su variación (VP escenario / VP base - 1, combinada con el
+tipo de cambio igual que una acción) entra como una columna más de la matriz de variaciones: así las tres
+metodologías y el beneficio de diversificación acciones-bonos salen de un único cálculo.
+
 Origen: adaptado y extendido de "Motor Var Acciones/Motor API/var_api_flask.py"
 (motor validado contra la plantilla Excel de VaR de acciones/fondos mutuos).
 """
@@ -27,7 +33,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
+
+from ..renta_fija.motor import ErrorDatosRentaFija, _flujos_df, curva_en_fechas, riesgo_instrumento
 
 METODOLOGIAS_VALIDAS = ("historico", "montecarlo", "parametrico")
 
@@ -46,9 +55,12 @@ class ResultadoMetodo:
     beneficio_diversificacion: float
     var_individual: Dict[str, float] = field(default_factory=dict)
     var_desagregado: Dict[str, float] = field(default_factory=dict)
+    # Expected shortfall: pérdida promedio en la cola que supera el VaR (mismo signo que el VaR)
+    cvar_diversificado: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
+            "cvarDiversificado": self.cvar_diversificado,
             "metodologia": self.metodologia,
             "nivelConfianza": self.nivel_confianza,
             "varDiversificado": self.var_diversificado,
@@ -65,8 +77,11 @@ class MotorVaR:
     históricos, con las 3 metodologías y los niveles de confianza pedidos.
     """
 
-    def __init__(self, parametros: dict, activos: List[dict], escenarios: List[dict]):
-        if len(activos) == 0:
+    def __init__(self, parametros: dict, activos: List[dict], escenarios: List[dict],
+                 renta_fija: Optional[dict] = None):
+        renta_fija = renta_fija or {}
+        bonos = renta_fija.get("instrumentos") or []
+        if len(activos) == 0 and not bonos:
             raise ErrorDatosVaR("El portafolio no tiene activos.")
         if len(escenarios) < 31:
             raise ErrorDatosVaR(
@@ -100,12 +115,7 @@ class MotorVaR:
                         f"El escenario #{esc.get('numero')} no tiene precio para '{nombre}'."
                     )
                 matriz_precios[i, j] = esc["precios"][nombre]
-
-                tc_key = f"{activo['monedaActivo']}_{self.moneda_reporte}"
-                if esc.get("tcHistorico") and tc_key in esc["tcHistorico"]:
-                    matriz_tc[i, j] = esc["tcHistorico"][tc_key]
-                else:
-                    matriz_tc[i, j] = self.tc_actual.get(tc_key, 1.0)
+                matriz_tc[i, j] = self._tc_escenario(esc, activo["monedaActivo"])
 
         # ------------------------------------------------------------------
         # 2. Variación combinada (precio + tipo de cambio) por escenario
@@ -122,9 +132,27 @@ class MotorVaR:
             self.tc_actual.get(f"{a['monedaActivo']}_{self.moneda_reporte}", 1.0)
             for a in activos
         ])
-        precios_iniciales = matriz_precios[-1, :]
-        num_acciones = np.array([a["numAcciones"] for a in activos])
+        # Precio de valorización: el `precioActual` del activo (el backend manda el último disponible, que puede
+        # ser posterior a la ventana cuando esta se recorta a las fechas con curva); si no viene, el del último escenario.
+        precios_iniciales = np.array([
+            float(a["precioActual"]) if a.get("precioActual") is not None else matriz_precios[-1, j]
+            for j, a in enumerate(activos)
+        ], dtype=float)
+        num_acciones = np.array([a["numAcciones"] for a in activos], dtype=float)
         self.mtm_por_activo = precios_iniciales * num_acciones * tc_conversion
+
+        # ------------------------------------------------------------------
+        # 3b. Renta fija: una columna de variación por bono, en las mismas fechas
+        # ------------------------------------------------------------------
+        self.riesgo_renta_fija: List[dict] = []
+        self.fecha_valoracion_rf: Optional[str] = None
+        if bonos:
+            var_bonos, mtm_bonos = self._renta_fija(renta_fija, escenarios_ordenados)
+            self.matriz_variacion = np.hstack([self.matriz_variacion, var_bonos])
+            self.mtm_por_activo = np.concatenate([self.mtm_por_activo, mtm_bonos])
+            self.nombres_activos = self.nombres_activos + [b["isin"] for b in bonos]
+            self.num_activos = len(self.nombres_activos)
+
         self.mtm_total = float(np.sum(self.mtm_por_activo))
 
         if self.mtm_total <= 0:
@@ -144,6 +172,62 @@ class MotorVaR:
             # np.cov con 1 sola columna devuelve un escalar; lo normalizamos a matriz 1x1
             self.covarianza_variacion = np.array([[float(self.covarianza_variacion)]])
 
+    def _tc_escenario(self, esc: dict, moneda: str) -> float:
+        tc_key = f"{moneda}_{self.moneda_reporte}"
+        if esc.get("tcHistorico") and tc_key in esc["tcHistorico"]:
+            return esc["tcHistorico"][tc_key]
+        return self.tc_actual.get(tc_key, 1.0)
+
+    def _renta_fija(self, bloque: dict, escenarios_ordenados: List[dict]):
+        """Variaciones (S-1, B) y MTM en moneda de reporte (B,) de los bonos, alineadas a los escenarios."""
+        if any(not e.get("fecha") for e in escenarios_ordenados):
+            raise ErrorDatosVaR("Para incluir renta fija cada escenario debe traer su 'fecha'.")
+        if not bloque.get("fechaValoracion"):
+            raise ErrorDatosVaR("rentaFija.fechaValoracion es obligatoria.")
+        try:
+            fecha_base = pd.Timestamp(bloque["fechaValoracion"]).normalize()
+            fechas = [pd.Timestamp(e["fecha"]).normalize() for e in escenarios_ordenados]
+            curvas_raw = bloque.get("curvas") or {}
+            curvas = {}
+            columnas, mtms = [], []
+            for instr in bloque["instrumentos"]:
+                for c in ("isin", "moneda", "curva", "nominal"):
+                    if c not in instr:
+                        raise ErrorDatosVaR(f"Instrumento de renta fija sin '{c}': {instr.get('isin', instr)}")
+                codigo = instr["curva"]
+                if codigo not in curvas:
+                    if codigo not in curvas_raw:
+                        raise ErrorDatosVaR(f"Falta la curva '{codigo}' en rentaFija.curvas.")
+                    curvas[codigo] = curva_en_fechas(curvas_raw[codigo], fecha_base, fechas, codigo)
+                curva = curvas[codigo]
+
+                flujos = _flujos_df({**instr, "tipo": instr.get("tipo", "BONO")}, fecha_base)
+                if (flujos["dias"] > 0).sum() == 0:
+                    raise ErrorDatosVaR(f"{instr['isin']} está vencido al {fecha_base.date()}.")
+                nominal = float(instr["nominal"])
+                factores = curva.factor_en(flujos["dias"].to_numpy())                 # (S, F)
+                vp = nominal * (factores * (flujos["montoPct"].to_numpy() / 100.0)[None, :]).sum(axis=1)
+                vp_base = float(vp[0])
+                if vp_base <= 0:
+                    raise ErrorDatosVaR(f"{instr['isin']}: valor presente no positivo en la fecha de valoración.")
+
+                # Mismo tratamiento cambiario que una acción: (1 + var. valor) * (1 + var. TC) - 1
+                tc = np.array([self._tc_escenario(e, instr["moneda"]) for e in escenarios_ordenados])
+                var_tc = tc[1:] / tc[:-1] - 1
+                columnas.append((vp[1:] / vp_base) * (1 + var_tc) - 1)
+                tc_hoy = self.tc_actual.get(f"{instr['moneda']}_{self.moneda_reporte}", 1.0)
+                mtms.append(vp_base * tc_hoy)
+
+                self.riesgo_renta_fija.append({
+                    "isin": instr["isin"], "moneda": instr["moneda"], "curva": codigo,
+                    "mtmOrigen": vp_base, "mtm": vp_base * tc_hoy,
+                    **riesgo_instrumento(flujos, curva, nominal, vp_base),
+                })
+        except ErrorDatosRentaFija as e:
+            raise ErrorDatosVaR(str(e)) from e
+        self.fecha_valoracion_rf = fecha_base.strftime("%Y-%m-%d")
+        return np.column_stack(columnas), np.array(mtms)
+
     # ======================================================================
     # Metodología 1: Histórica (percentil empírico)
     # ======================================================================
@@ -159,6 +243,7 @@ class MotorVaR:
 
         pl_total_ordenado = np.sort(self.pl_total_hist)
         var_div = float(pl_total_ordenado[k_index])
+        cvar_div = float(np.mean(pl_total_ordenado[: k_index + 1]))
 
         # Escenario donde ocurre el VaR diversificado → VaR desagregado (marginal) por activo
         idx_var = int(np.argmin(np.abs(self.pl_total_hist - var_div)))
@@ -167,7 +252,7 @@ class MotorVaR:
             for i, nombre in enumerate(self.nombres_activos)
         }
 
-        return self._empaquetar("historico", nivel_confianza, var_div, var_individual, var_desagregado)
+        return self._empaquetar("historico", nivel_confianza, var_div, var_individual, var_desagregado, cvar_div)
 
     # ======================================================================
     # Metodología 2: Monte Carlo (simulación normal multivariada)
@@ -194,6 +279,7 @@ class MotorVaR:
 
         pl_total_ordenado = np.sort(pl_total_sim)
         var_div = float(pl_total_ordenado[k_index])
+        cvar_div = float(np.mean(pl_total_ordenado[: k_index + 1]))
 
         idx_var = int(np.argmin(np.abs(pl_total_sim - var_div)))
         var_desagregado = {
@@ -201,7 +287,7 @@ class MotorVaR:
             for i, nombre in enumerate(self.nombres_activos)
         }
 
-        return self._empaquetar("montecarlo", nivel_confianza, var_div, var_individual, var_desagregado)
+        return self._empaquetar("montecarlo", nivel_confianza, var_div, var_individual, var_desagregado, cvar_div)
 
     # ======================================================================
     # Metodología 3: Paramétrico / delta-normal (analítico)
@@ -215,6 +301,8 @@ class MotorVaR:
         varianza_portafolio = float(w @ sigma @ w)
         desv_portafolio = float(np.sqrt(max(varianza_portafolio, 0.0)))
         var_div = z * desv_portafolio
+        # ES normal: -sigma * phi(z) / (1 - c), con el mismo signo de pérdida que el VaR
+        cvar_div = -desv_portafolio * float(norm.pdf(z)) / (1 - nivel_confianza)
 
         # Asignación de Euler: componente_i = z * w_i * (Σw)_i / desv_portafolio.
         # Por homogeneidad de grado 1 de la desviación estándar, la suma de los componentes
@@ -234,7 +322,7 @@ class MotorVaR:
             for i, nombre in enumerate(self.nombres_activos)
         }
 
-        return self._empaquetar("parametrico", nivel_confianza, var_div, var_individual, var_desagregado)
+        return self._empaquetar("parametrico", nivel_confianza, var_div, var_individual, var_desagregado, cvar_div)
 
     # ======================================================================
     # Utilidades comunes
@@ -264,6 +352,7 @@ class MotorVaR:
         var_div: float,
         var_individual: Dict[str, float],
         var_desagregado: Dict[str, float],
+        cvar_div: Optional[float] = None,
     ) -> ResultadoMetodo:
         var_no_div = sum(var_individual.values())
         beneficio = var_no_div - var_div
@@ -275,6 +364,7 @@ class MotorVaR:
             beneficio_diversificacion=beneficio,
             var_individual=var_individual,
             var_desagregado=var_desagregado,
+            cvar_diversificado=cvar_div,
         )
 
     def calcular(
@@ -319,5 +409,7 @@ class MotorVaR:
         # reales con fecha real); Monte Carlo genera miles de simulaciones sintéticas sin fecha.
         if "historico" in metodologias:
             salida["distribucionHistorica"] = self.pl_total_hist.tolist()
+        if self.riesgo_renta_fija:
+            salida["rentaFija"] = {"fechaValoracion": self.fecha_valoracion_rf, "instrumentos": self.riesgo_renta_fija}
 
         return salida
